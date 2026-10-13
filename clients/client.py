@@ -3,6 +3,8 @@ import socket
 import threading
 from .messages import build_handshake, parse_handshake, recv_exact
 
+logger = logging.getLogger(__name__)
+
 class Client:
     """One prototype peer, with a listener and a worker per connection."""
 
@@ -15,7 +17,7 @@ class Client:
 
         # TODO: choose a structure for preferred neighbors and choking state.
         # list? idk if order matters
-        self.preferred_neighbors = None
+        self.preferred_neighbors = []
 
         self.listener_thread = None
         self.connection_threads = []
@@ -144,3 +146,4 @@ class Client:
             self.listener_thread.join()
         for thread in threads:
             thread.join()
+
