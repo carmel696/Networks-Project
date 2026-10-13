@@ -3,6 +3,8 @@ import socket
 import threading
 from .messages import build_handshake, parse_handshake, recv_exact
 
+logger = logging.getLogger(__name__)
+
 class Client:
     """One prototype peer, with a listener and a worker per connection."""
 
@@ -140,3 +142,4 @@ class Client:
             self.listener_thread.join()
         for thread in threads:
             thread.join()
+

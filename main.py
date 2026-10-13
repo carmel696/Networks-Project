@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 import sys
 import threading
+import os
+
 
 from clients.client import Client
 
@@ -32,6 +34,7 @@ def load_config(config_dir):
     return config, peers
 
 
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -46,12 +49,15 @@ def main():
     args = parser.parse_args()
 
 
-    logging.basicConfig(level=logging.INFO, format=f"{{asctime}} - {{levelname}} - {{message}}")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     config, peers = load_config(args.config_dir)
     clients = []
 
     try:
         for index, peer in enumerate(peers):
+            # initalize peer directories for fille storage
+            os.makedirs(f"logging/peer_{peer["peer_id"]}", exist_ok=True)
+
             # Local overrides leave the original configuration files intact.
             host = "127.0.0.1" if args.local else peer["host"]
             port = args.base_port + index if args.local else peer["port"]
