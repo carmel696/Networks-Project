@@ -46,7 +46,7 @@ def main():
     args = parser.parse_args()
 
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(level=logging.INFO, format=f"{{asctime}} - {{levelname}} - {{message}}")
     config, peers = load_config(args.config_dir)
     clients = []
 

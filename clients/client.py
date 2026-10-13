@@ -15,7 +15,7 @@ class Client:
 
         # TODO: choose a structure for preferred neighbors and choking state.
         # list? idk if order matters
-        self.preferred_neighbors = None
+        self.preferred_neighbors = []
 
         self.listener_thread = None
         self.connection_threads = []
