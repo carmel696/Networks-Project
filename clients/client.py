@@ -59,30 +59,32 @@ class Client:
                 if not self._stop_event.is_set():
                     logging.exception("Peer %s listener failed", self.peer_id)
                 break
-            self._start_connection(conn, addr)
+            self._start_connection(conn, addr, initiated=False)
 
     def connect(self, host, port):
         """Use the same worker for an outgoing socket as for an accepted one."""
         conn = socket.create_connection((host, port), timeout=3)
         conn.settimeout(None)
-        self._start_connection(conn, conn.getpeername())
+        self._start_connection(conn, conn.getpeername(), initiated=True)
 
-    def _start_connection(self, conn, addr):
+    def _start_connection(self, conn, addr, initiated):
         with self._lock:
+
             if self._stop_event.is_set():
                 conn.close()
                 return
+            
             thread = threading.Thread(
                 target=self.handle_connection,
-                args=(conn, addr),
+                args=(conn, addr, initiated),
                 name=f"peer-{self.peer_id}-connection-{addr[0]}:{addr[1]}",
             )
+
             self.connections[addr] = conn
             self.connection_threads.append(thread)
             thread.start()
 
-    def handle_connection(self, conn, addr):
-        logging.info("Peer %s connected to %s", self.peer_id, addr)
+    def handle_connection(self, conn, addr, initiated):
         try:
             with conn:
                 #send handshake message
@@ -92,7 +94,11 @@ class Client:
                 data = recv_exact(conn, 32)
 
                 other_id = parse_handshake(data)
-                logging.info("Peer %s handshook with peer %s", self.peer_id, other_id)
+
+                if initiated:
+                    logging.info("Peer %s makes a connection to Peer %s.", self.peer_id, other_id)
+                else:
+                    logging.info("Peer %s is connected from Peer %s.", self.peer_id, other_id)
                 
                 while not self._stop_event.is_set():
                     data = conn.recv(4096)
