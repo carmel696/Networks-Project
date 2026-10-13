@@ -59,15 +59,15 @@ class Client:
                 if not self._stop_event.is_set():
                     logging.exception("Peer %s listener failed", self.peer_id)
                 break
-            self._start_connection(conn, addr, initiated=False)
+            self._start_connection(conn, addr, initiated=False, expected_id=None)
 
-    def connect(self, host, port):
+    def connect(self, host, port, expected_id):
         """Use the same worker for an outgoing socket as for an accepted one."""
         conn = socket.create_connection((host, port), timeout=3)
         conn.settimeout(None)
-        self._start_connection(conn, conn.getpeername(), initiated=True)
+        self._start_connection(conn, conn.getpeername(), initiated=True, expected_id=expected_id)
 
-    def _start_connection(self, conn, addr, initiated):
+    def _start_connection(self, conn, addr, initiated, expected_id):
         with self._lock:
 
             if self._stop_event.is_set():
@@ -76,7 +76,7 @@ class Client:
             
             thread = threading.Thread(
                 target=self.handle_connection,
-                args=(conn, addr, initiated),
+                args=(conn, addr, initiated, expected_id),
                 name=f"peer-{self.peer_id}-connection-{addr[0]}:{addr[1]}",
             )
 
@@ -84,7 +84,7 @@ class Client:
             self.connection_threads.append(thread)
             thread.start()
 
-    def handle_connection(self, conn, addr, initiated):
+    def handle_connection(self, conn, addr, initiated, expected_id):
         try:
             with conn:
                 #send handshake message
@@ -94,6 +94,8 @@ class Client:
                 data = recv_exact(conn, 32)
 
                 other_id = parse_handshake(data)
+                if expected_id is not None and other_id != expected_id:
+                    raise ValueError(f"expected peer {expected_id}, got {other_id}")
 
                 if initiated:
                     logging.info("Peer %s makes a connection to Peer %s.", self.peer_id, other_id)
@@ -105,9 +107,11 @@ class Client:
                     if not data:
                         break
                     self.handle_data(data, addr)
-        except OSError:
+
+        except (OSError, ValueError):
             if not self._stop_event.is_set():
                 logging.exception("Peer %s connection to %s failed", self.peer_id, addr)
+        
         finally:
             with self._lock:
                 if self.connections.get(addr) is conn:

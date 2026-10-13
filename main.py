@@ -63,7 +63,7 @@ def main():
         # Each peer initiates only toward peers before it, avoiding duplicates.
         for index, client in enumerate(clients):
             for earlier_peer in clients[:index]:
-                client.connect(earlier_peer.host, earlier_peer.port)
+                client.connect(earlier_peer.host, earlier_peer.port, earlier_peer.peer_id)
 
         logging.info("Started %s peers. Press Ctrl+C to stop.", len(clients))
         # TODO: replace this wait with detection that all peers have the file.
