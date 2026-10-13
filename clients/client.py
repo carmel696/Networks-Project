@@ -1,7 +1,7 @@
 import logging
 import socket
 import threading
-
+from .messages import build_handshake, parse_handshake, recv_exact
 
 class Client:
     """One prototype peer, with a listener and a worker per connection."""
@@ -85,8 +85,15 @@ class Client:
         logging.info("Peer %s connected to %s", self.peer_id, addr)
         try:
             with conn:
-                # TODO: exchange the 32-byte handshake and verify the peer ID.
-                # TODO: buffer TCP bytes and decode length-prefixed messages.
+                #send handshake message
+                conn.sendall(build_handshake(self.peer_id))
+                
+                # read other peer's handshake
+                data = recv_exact(conn, 32)
+
+                other_id = parse_handshake(data)
+                logging.info("Peer %s handshook with peer %s", self.peer_id, other_id)
+                
                 while not self._stop_event.is_set():
                     data = conn.recv(4096)
                     if not data:
