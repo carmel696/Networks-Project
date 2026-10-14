@@ -2,7 +2,7 @@
 
 import argparse
 import logging
-import Logger
+from logger import Proc_Logger
 from pathlib import Path
 import sys
 import threading
@@ -66,6 +66,10 @@ def main():
             else:
                 with open(f"proc_logging/peer_files/peer_{peer["peer_id"]}/thefile", "w") as f:
                     f.write("")
+
+            # creates the logging files for each peer within their "logger" directory folders
+            Logger = Proc_Logger()
+            Logger.create_peer_log(peer_id=peer["peer_id"])
 
             # Local overrides leave the original configuration files intact.
             host = "127.0.0.1" if args.local else peer["host"]
