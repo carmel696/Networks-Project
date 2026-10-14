@@ -4,7 +4,8 @@ import threading
 import math
 
 from .messages import (build_handshake, parse_handshake, recv_exact, 
-                       build_message, read_message, bitfield_to_bytes)
+                       build_message, read_message, bitfield_to_bytes,
+                       bytes_to_bitfield)
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +29,15 @@ class Client:
         self.has_file = has_file
         self.config = dict(config)
 
+        # calculate the number of pieces based on file size and piece size and set the bit field
         self.num_pieces = math.ceil(config["FileSize"] / config["PieceSize"])
-        self.bitfield = [has_file] * self.num_pieces
+        # [True, False, True]
+        self.bitfield = [has_file] * self.num_pieces 
 
         # TODO: choose a structure for preferred neighbors and choking state.
         # list? idk if order matters
+        # key is peer id and value is the bitfield of that peer as a list
+        self.neighbor_bitfields = {}
         self.preferred_neighbors = []
 
         self.listener_thread = None
@@ -115,6 +120,9 @@ class Client:
                 if expected_id is not None and other_id != expected_id:
                     raise ValueError(f"expected peer {expected_id}, got {other_id}")
 
+                # initialize this neighbors bitfield to nothing
+                self.neighbor_bitfields[other_id] = [False] * self.num_pieces
+
                 # log connection
                 if initiated:
                     logging.info("Peer %s makes a connection to Peer %s.", self.peer_id, other_id)
@@ -127,7 +135,7 @@ class Client:
                 
                 while not self._stop_event.is_set():
                     msg_type, payload = read_message(conn)
-                    self.handle_message(msg_type, payload, other_id)
+                    self.handle_message(conn, msg_type, payload, other_id)
 
         except (OSError, ValueError):
             if not self._stop_event.is_set():
@@ -139,10 +147,23 @@ class Client:
                     del self.connections[addr]
             logging.info("Peer %s disconnected from %s", self.peer_id, addr)
 
-    def handle_message(self, msg_type, payload, other_id):
+    def handle_message(self, conn, msg_type, payload, other_id):
         """Placeholder: a recv chunk is not necessarily a complete message."""
         logging.info("Peer %s got message type %s (%s bytes) from %s", self.peer_id, msg_type, len(payload), other_id)
-        # TODO: dispatch messages and update piece/preferred-neighbor state.
+        
+        # handle a bitfield message
+        if msg_type == BITFIELD:
+            others_bitfield = bytes_to_bitfield(payload, self.num_pieces)
+
+            # lock dictionary so that threads don't overwrite
+            with self._lock:
+                self.neighbor_bitfields[other_id] = others_bitfield
+
+            if self.neighbor_has_something_i_need(others_bitfield):
+                conn.sendall(build_message(INTERESTED))
+            else:
+                conn.sendall(build_message(NOT_INTERESTED))
+
 
     def stop(self):
         """Wake blocked socket workers and wait for all tracked threads."""
@@ -165,4 +186,12 @@ class Client:
             self.listener_thread.join()
         for thread in threads:
             thread.join()
+
+    # helper establishing interest
+    def neighbor_has_something_i_need(self, thiers):
+        for i in range(self.num_pieces):
+            if thiers[i] and not self.bitfield[i]:
+                return True
+            else:
+                return False
 
