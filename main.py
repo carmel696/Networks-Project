@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+from logger import Proc_Logger
 from pathlib import Path
 import sys
 import threading
@@ -34,7 +35,6 @@ def load_config(config_dir):
     return config, peers
 
 
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -55,8 +55,21 @@ def main():
 
     try:
         for index, peer in enumerate(peers):
-            # initalize peer directories for fille storage
-            os.makedirs(f"logging/peer_{peer["peer_id"]}", exist_ok=True)
+            # initalize peer directories for file storage in logging/peer_files/peer_ID
+            os.makedirs(f"proc_logging/peer_files/peer_{peer["peer_id"]}", exist_ok=True)
+            # fills out the files for the peers that start with it
+            if (peer["has_file"] == True):
+                with open(f"{args.config_dir}/{peer["peer_id"]}/thefile") as f:
+                    completeFile = f.read()
+                with open(f"proc_logging/peer_files/peer_{peer["peer_id"]}/thefile", "w") as f:
+                    f.write(completeFile)
+            else:
+                with open(f"proc_logging/peer_files/peer_{peer["peer_id"]}/thefile", "w") as f:
+                    f.write("")
+
+            # creates the logging files for each peer within their "logger" directory folders
+            Logger = Proc_Logger()
+            Logger.create_peer_log(peer_id=peer["peer_id"])
 
             # Local overrides leave the original configuration files intact.
             host = "127.0.0.1" if args.local else peer["host"]
