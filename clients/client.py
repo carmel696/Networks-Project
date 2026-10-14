@@ -1,6 +1,8 @@
 import logging
+from logger import Proc_Logger
 import socket
 import threading
+import time
 from .messages import build_handshake, parse_handshake, recv_exact
 
 logger = logging.getLogger(__name__)
@@ -49,7 +51,10 @@ class Client:
             name=f"peer-{self.peer_id}-listener",
         )
         self.listener_thread.start()
-        logging.info("Peer %s listening on %s:%s", self.peer_id, self.host, self.port)
+
+     
+
+        # logging.info("Peer %s listening on %s:%s", self.peer_id, self.host, self.port)
 
     def _accept_connections(self):
         while not self._stop_event.is_set():
@@ -98,6 +103,10 @@ class Client:
                 other_id = parse_handshake(data)
                 if expected_id is not None and other_id != expected_id:
                     raise ValueError(f"expected peer {expected_id}, got {other_id}")
+
+                # this logs the inital connection messages
+                Logger = Proc_Logger()
+                Logger.log_TCP_connection(time.time(), self.peer_id, other_id)
 
                 if initiated:
                     logging.info("Peer %s makes a connection to Peer %s.", self.peer_id, other_id)

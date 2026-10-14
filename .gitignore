@@ -1,3 +1,4 @@
 .DS_Store
 pycache/ *.pyc
 logging/peer_files/
+clients/__pycache__/*.pyc
