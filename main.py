@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import Logger
 from pathlib import Path
 import sys
 import threading
@@ -55,13 +56,16 @@ def main():
     try:
         for index, peer in enumerate(peers):
             # initalize peer directories for file storage in logging/peer_files/peer_ID
-            os.makedirs(f"logging/peer_files/peer_{peer["peer_id"]}", exist_ok=True)
+            os.makedirs(f"proc_logging/peer_files/peer_{peer["peer_id"]}", exist_ok=True)
             # fills out the files for the peers that start with it
             if (peer["has_file"] == True):
                 with open(f"{args.config_dir}/{peer["peer_id"]}/thefile") as f:
                     completeFile = f.read()
-                with open(f"logging/peer_files/peer_{peer["peer_id"]}/thefile", "w") as f:
+                with open(f"proc_logging/peer_files/peer_{peer["peer_id"]}/thefile", "w") as f:
                     f.write(completeFile)
+            else:
+                with open(f"proc_logging/peer_files/peer_{peer["peer_id"]}/thefile", "w") as f:
+                    f.write("")
 
             # Local overrides leave the original configuration files intact.
             host = "127.0.0.1" if args.local else peer["host"]
