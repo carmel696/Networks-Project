@@ -56,7 +56,7 @@ def main():
     try:
         for index, peer in enumerate(peers):
             # initalize peer directories for fille storage
-            os.makedirs(f"logging/peer_{peer["peer_id"]}", exist_ok=True)
+            os.makedirs(f"logging/peer_files/peer_{peer["peer_id"]}", exist_ok=True)
 
             # Local overrides leave the original configuration files intact.
             host = "127.0.0.1" if args.local else peer["host"]
