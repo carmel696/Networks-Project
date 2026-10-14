@@ -1,9 +1,22 @@
 import logging
 import socket
 import threading
-from .messages import build_handshake, parse_handshake, recv_exact
+import math
+
+from .messages import (build_handshake, parse_handshake, recv_exact, 
+                       build_message, read_message, bitfield_to_bytes)
 
 logger = logging.getLogger(__name__)
+
+#msg types
+CHOKE = 0
+UNCHOKE = 1
+INTERESTED = 2
+NOT_INTERESTED = 3
+HAVE = 4
+BITFIELD = 5
+REQUEST = 6
+PIECE = 7
 
 class Client:
     """One prototype peer, with a listener and a worker per connection."""
@@ -14,6 +27,9 @@ class Client:
         self.port = port
         self.has_file = has_file
         self.config = dict(config)
+
+        self.num_pieces = math.ceil(config["FileSize"] / config["PieceSize"])
+        self.bitfield = [has_file] * self.num_pieces
 
         # TODO: choose a structure for preferred neighbors and choking state.
         # list? idk if order matters
@@ -91,24 +107,27 @@ class Client:
             with conn:
                 #send handshake message
                 conn.sendall(build_handshake(self.peer_id))
-                
+
                 # read other peer's handshake
                 data = recv_exact(conn, 32)
-
                 other_id = parse_handshake(data)
+                # validate
                 if expected_id is not None and other_id != expected_id:
                     raise ValueError(f"expected peer {expected_id}, got {other_id}")
 
+                # log connection
                 if initiated:
                     logging.info("Peer %s makes a connection to Peer %s.", self.peer_id, other_id)
                 else:
                     logging.info("Peer %s is connected from Peer %s.", self.peer_id, other_id)
+
+                # send bitfield to other peer if self has any pieces
+                if any(self.bitfield):
+                    conn.sendall(build_message(BITFIELD, bitfield_to_bytes(self.bitfield)))
                 
                 while not self._stop_event.is_set():
-                    data = conn.recv(4096)
-                    if not data:
-                        break
-                    self.handle_data(data, addr)
+                    msg_type, payload = read_message(conn)
+                    self.handle_message(msg_type, payload, other_id)
 
         except (OSError, ValueError):
             if not self._stop_event.is_set():
@@ -120,9 +139,9 @@ class Client:
                     del self.connections[addr]
             logging.info("Peer %s disconnected from %s", self.peer_id, addr)
 
-    def handle_data(self, data, addr):
+    def handle_message(self, msg_type, payload, other_id):
         """Placeholder: a recv chunk is not necessarily a complete message."""
-        logging.info("Peer %s received %s bytes from %s", self.peer_id, len(data), addr)
+        logging.info("Peer %s got message type %s (%s bytes) from %s", self.peer_id, msg_type, len(payload), other_id)
         # TODO: dispatch messages and update piece/preferred-neighbor state.
 
     def stop(self):
