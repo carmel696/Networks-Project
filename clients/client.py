@@ -5,6 +5,7 @@ import threading
 import time
 import math
 import random
+from pathlib import Path
 
 from .messages import (build_handshake, parse_handshake, recv_exact, 
                        build_message, read_message, bitfield_to_bytes,
@@ -31,6 +32,9 @@ class Client:
         self.port = port
         self.has_file = has_file
         self.config = dict(config)
+
+        # file path
+        self.file_path = Path("proc_logging") / "peer_files" / f"peer_{peer_id}" / config["FileName"]
 
         # calculate the number of pieces based on file size and piece size and set the bit field
         self.num_pieces = math.ceil(config["FileSize"] / config["PieceSize"])
@@ -213,6 +217,30 @@ class Client:
             if piece is not None:
                 conn.sendall(build_message(REQUEST, piece.to_bytes(4, "big")))
 
+        elif msg_type == REQUEST:
+            # send requested piece
+            index = int.from_bytes(payload, "big")
+
+            # only send piece if requester is still a preferred neighbor
+            with self._lock:
+                allowed = other_id in self.preferred_neighbors
+            if allowed:
+                data = self.read_piece(index)
+                conn.sendall(build_message(PIECE, index.to_bytes(4, "big") + data))     
+
+        elif msg_type == PIECE:
+            index = int.from_bytes(payload[:4], "big")
+            data = payload[4:]
+            # write piece to peer's file
+            self.write_piece(index, data)
+
+            # update bitfield
+            with self._lock:
+                self.bitfield[index] = True
+                count = sum(self.bitfield)
+
+            logging.info("Peer %s has downloaded the piece %s from peer %s. Now the number of pieces it has is %s.", self.peer_id, index, other_id, count)
+
 
     def stop(self):
         """Wake blocked socket workers and wait for all tracked threads."""
@@ -283,13 +311,10 @@ class Client:
            
     # helper send function
     def _send(self, peer_id, data):
-
         with self._lock:
             conn = self.conns_peers.get(peer_id)
-
         if conn is None:
             return
-
         try:
             conn.sendall(data)
         except OSError:
@@ -305,5 +330,25 @@ class Client:
             if not mine[i] and thiers[i]:
                 candidate_pieces.append(i)
 
+        if not candidate_pieces:
+            return None
         return random.choice(candidate_pieces)
+
+    def read_piece(self, index):
+        piece_size = self.config["PieceSize"]
+        start = index * piece_size
+        size = min(piece_size, self.config["FileSize"] - start)
+
+        with open(self.file_path, "rb") as f:
+            f.seek(start)
+            return f.read(size)
+
+    def write_piece(self, index, data):
+        piece_size = self.config["PieceSize"]
+        start = index * piece_size
+    
+        with open(self.file_path, "wb") as f:
+            f.seek(start)
+            return f.write(data)
+
         
