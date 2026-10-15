@@ -86,7 +86,13 @@ class Client:
             target=self._preferred_neighbors_loop,
             name=f"peer-{self.peer_id}-preferred-timer"
         )
-        self.timer_thread.start()     
+        self.timer_thread.start()    
+
+        # create an empty file that is the size of the full file for each peer
+        if not self.has_file:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.file_path, "wb") as f:
+                f.truncate(self.config["FileSize"]) 
 
         # logging.info("Peer %s listening on %s:%s", self.peer_id, self.host, self.port)
 
@@ -347,8 +353,8 @@ class Client:
         piece_size = self.config["PieceSize"]
         start = index * piece_size
     
-        with open(self.file_path, "wb") as f:
+        with open(self.file_path, "r+b") as f:
             f.seek(start)
-            return f.write(data)
+            f.write(data)
 
         
