@@ -231,3 +231,19 @@ class Client:
         #TODO: handle selecting preferred neighbors when its not just completely random
         return set()
 
+    def _preferred_neighbors_loop(self):
+        interval = self.config["UnchokingInterval"]
+
+        # select preferred neighbors every UnchokingInterval seconds
+        while not self._stop_event.wait(interval):
+            chosen = self.select_preferred_neighbors
+
+            with self._lock:
+                changed = chosen != self.preferred_neighbors
+                self.preferred_neighbors = chosen
+                
+            # if the preferred neighbors are different from the last interval, log that
+            if changed:
+                logging.info("Peer %s has the preferred neighbors %s.",
+                         self.peer_id, ",".join(str(i) for i in sorted(chosen)))
+
