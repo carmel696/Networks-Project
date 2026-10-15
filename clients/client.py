@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 import math
+import random
 
 from .messages import (build_handshake, parse_handshake, recv_exact, 
                        build_message, read_message, bitfield_to_bytes,
@@ -36,11 +37,12 @@ class Client:
         # [True, False, True]
         self.bitfield = [has_file] * self.num_pieces 
 
-        # TODO: choose a structure for preferred neighbors and choking state.
-        # list? idk if order matters
         # key is peer id and value is the bitfield of that peer as a list
         self.neighbor_bitfields = {}
-        self.preferred_neighbors = []
+
+        # keep track of neighbors that are interested and preferred neighbors
+        self.interested_neighbors = set()
+        self.preferred_neighbors = set()
 
         self.listener_thread = None
         self.connection_threads = []
@@ -173,6 +175,18 @@ class Client:
             else:
                 conn.sendall(build_message(NOT_INTERESTED))
 
+        elif msg_type == INTERESTED:
+            # if recieving an interested message, add that peer to the interested neighbors set
+            with self._lock:
+                self.interested_neighbors.add(other_id)
+            logging.info("Peer %s received the 'interested' message from %s.", self.peer_id, other_id)
+
+        elif msg_type == NOT_INTERESTED:
+            # if recieving a not interested message, add that peer to the interested neighbors set
+            with self._lock:
+                self.interested_neighbors.discard(other_id)
+            logging.info("Peer %s received the 'not interested' message from %s.", self.peer_id, other_id)
+
 
     def stop(self):
         """Wake blocked socket workers and wait for all tracked threads."""
@@ -203,4 +217,17 @@ class Client:
                 return True
             else:
                 return False
+
+    def select_preferred_neighbors(self):
+        k = self.config["NumberOfPreferredNighbors"]
+
+        with self._lock:
+            candidates = list(self.interested_neighbors)
+
+        # if the peer has the whole file, randomly select k neighbors for unchoking
+        if all(self.bitfield):
+            return set(random.sample(candidates, min(k, len(candidates))))
+
+        #TODO: handle selecting preferred neighbors when its not just completely random
+        return set()
 
