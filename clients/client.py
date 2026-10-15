@@ -208,6 +208,10 @@ class Client:
 
         elif msg_type == UNCHOKE:
             logging.info("Peer %s is unchoked by %s.", self.peer_id, other_id)
+            # send request message
+            piece = self.request_piece(other_id)
+            if piece is not None:
+                conn.sendall(build_message(REQUEST, piece.to_bytes(4, "big")))
 
 
     def stop(self):
@@ -276,9 +280,7 @@ class Client:
                 # for each neighbor that is no longer preferred, send that neighbor a choke message
                 for peer in old - chosen:
                     self._send(peer, build_message(CHOKE))
-
-                
-
+           
     # helper send function
     def _send(self, peer_id, data):
 
@@ -292,3 +294,16 @@ class Client:
             conn.sendall(data)
         except OSError:
             pass
+
+    def request_piece(self, other_id):
+        mine = self.bitfield
+        thiers = self.neighbor_bitfields[other_id]
+        candidate_pieces = []
+
+        # a possible piece to request is a piece that the requested has that the requester does not have
+        for i in range(self.num_pieces):
+            if not mine[i] and thiers[i]:
+                candidate_pieces.append(i)
+
+        return random.choice(candidate_pieces)
+        
