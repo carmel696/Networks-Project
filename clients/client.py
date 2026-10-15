@@ -47,7 +47,9 @@ class Client:
         self.listener_thread = None
         self.connection_threads = []
         # Addresses are temporary keys until the handshake identifies each peer.
-        self.connections = {}
+        self.conns_addrs = {}
+        # key is peer id and value is connection
+        self.conns_peers = {}
         self._server = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -75,7 +77,12 @@ class Client:
         )
         self.listener_thread.start()
 
-     
+        # creating a thread for the timers
+        self.timer_thread = threading.Thread(
+            target=self._preferred_neighbors_loop,
+            name=f"peer-{self.peer_id}-preferred-timer"
+        )
+        self.timer_thread.start()     
 
         # logging.info("Peer %s listening on %s:%s", self.peer_id, self.host, self.port)
 
@@ -110,11 +117,12 @@ class Client:
                 name=f"peer-{self.peer_id}-connection-{addr[0]}:{addr[1]}",
             )
 
-            self.connections[addr] = conn
+            self.conns_addrs[addr] = conn
             self.connection_threads.append(thread)
             thread.start()
 
     def handle_connection(self, conn, addr, initiated, expected_id):
+        other_id = None
         try:
             with conn:
                 #send handshake message
@@ -126,6 +134,10 @@ class Client:
                 # validate
                 if expected_id is not None and other_id != expected_id:
                     raise ValueError(f"expected peer {expected_id}, got {other_id}")
+
+                # add connection to conns_peer (which tracks id to sockets)
+                with self._lock:
+                    self.conns_peers[other_id] = conn
 
                 # this logs the inital connection messages
                 Logger = Proc_Logger()
@@ -154,9 +166,13 @@ class Client:
         
         finally:
             with self._lock:
-                if self.connections.get(addr) is conn:
-                    del self.connections[addr]
-            logging.info("Peer %s disconnected from %s", self.peer_id, addr)
+                if  self.conns_addrs.get(addr) is conn:
+                    del self.conns_addrs[addr]
+
+                if other_id is not None and self.conns_peers.get(other_id) == conn:
+                    del self.conns_peers[other_id]
+
+            logging.info("Peer %s disconnected from %s", self.peer_id, other_id)
 
     def handle_message(self, conn, msg_type, payload, other_id):
         """Placeholder: a recv chunk is not necessarily a complete message."""
@@ -187,6 +203,12 @@ class Client:
                 self.interested_neighbors.discard(other_id)
             logging.info("Peer %s received the 'not interested' message from %s.", self.peer_id, other_id)
 
+        elif msg_type == CHOKE:
+            logging.info("Peer %s is choked by %s.", self.peer_id, other_id)
+
+        elif msg_type == UNCHOKE:
+            logging.info("Peer %s is unchoked by %s.", self.peer_id, other_id)
+
 
     def stop(self):
         """Wake blocked socket workers and wait for all tracked threads."""
@@ -195,7 +217,7 @@ class Client:
             self._server.close()
 
         with self._lock:
-            connections = list(self.connections.values())
+            connections = list(self.conns_addrs.values())
             threads = list(self.connection_threads)
 
         for conn in connections:
@@ -219,7 +241,7 @@ class Client:
                 return False
 
     def select_preferred_neighbors(self):
-        k = self.config["NumberOfPreferredNighbors"]
+        k = self.config["NumberOfPreferredNeighbors"]
 
         with self._lock:
             candidates = list(self.interested_neighbors)
@@ -236,14 +258,37 @@ class Client:
 
         # select preferred neighbors every UnchokingInterval seconds
         while not self._stop_event.wait(interval):
-            chosen = self.select_preferred_neighbors
+            chosen = self.select_preferred_neighbors()
 
             with self._lock:
-                changed = chosen != self.preferred_neighbors
+                old = self.preferred_neighbors
                 self.preferred_neighbors = chosen
-                
+
             # if the preferred neighbors are different from the last interval, log that
-            if changed:
+            if chosen != old:
                 logging.info("Peer %s has the preferred neighbors %s.",
                          self.peer_id, ",".join(str(i) for i in sorted(chosen)))
 
+                # for each newly preferred neighbor, send that neighbor an unchoke message
+                for peer in chosen - old:
+                    self._send(peer, build_message(UNCHOKE))
+
+                # for each neighbor that is no longer preferred, send that neighbor a choke message
+                for peer in old - chosen:
+                    self._send(peer, build_message(CHOKE))
+
+                
+
+    # helper send function
+    def _send(self, peer_id, data):
+
+        with self._lock:
+            conn = self.conns_peers.get(peer_id)
+
+        if conn is None:
+            return
+
+        try:
+            conn.sendall(data)
+        except OSError:
+            pass

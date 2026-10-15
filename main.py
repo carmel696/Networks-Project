@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import threading
 import os
+import time
 
 
 from clients.client import Client
@@ -86,7 +87,9 @@ def main():
 
         logging.info("Started %s peers. Press Ctrl+C to stop.", len(clients))
         # TODO: replace this wait with detection that all peers have the file.
-        threading.Event().wait()
+        while True:
+            time.sleep(1)
+            
     except KeyboardInterrupt:
         # ctr c
         logging.info("Stopping peers.")
