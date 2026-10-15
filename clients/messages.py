@@ -42,3 +42,10 @@ def bitfield_to_bytes(bitfield):
             data[i // 8] |= 1 << (7 - i % 8)
 
     return bytes(data)
+
+def bytes_to_bitfield(data, num_pieces):
+    bitfield = []
+    for i in range(num_pieces):
+        bitfield.append(bool(data[i // 8] & (1 << (7 - i % 8))))
+
+    return bitfield
