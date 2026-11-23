@@ -31,6 +31,8 @@ def build_message(msg_type, payload=b""):
 
 def read_message(conn):
     length = int.from_bytes(recv_exact(conn, 4), "big")
+    if length == 0:
+        raise ValueError("message length must include the type byte")
     body = recv_exact(conn, length)
     return body[0], body[1:]
 

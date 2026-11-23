@@ -1,19 +1,26 @@
 import logging
-from logger import Proc_Logger
+import random
 import socket
 import threading
 import time
-import math
-import random
+from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Queue
 
-from .messages import (build_handshake, parse_handshake, recv_exact, 
-                       build_message, read_message, bitfield_to_bytes,
-                       bytes_to_bitfield)
+from logger import Proc_Logger
+
+from .messages import (
+    bitfield_to_bytes,
+    build_handshake,
+    build_message,
+    bytes_to_bitfield,
+    parse_handshake,
+    read_message,
+    recv_exact,
+)
 
 logger = logging.getLogger(__name__)
 
-#msg types
 CHOKE = 0
 UNCHOKE = 1
 INTERESTED = 2
@@ -23,45 +30,68 @@ BITFIELD = 5
 REQUEST = 6
 PIECE = 7
 
+
+@dataclass
+class Neighbor:
+    bitfield: list[bool]
+    outgoing: Queue[bytes | None] = field(default_factory=Queue)
+    interested: bool = False
+    interest_sent: bool | None = None
+    unchoked_by: bool = False
+    requested_piece: int | None = None
+    downloaded_bytes: int = 0
+
+    def send(self, message_type, payload=b""):
+        self.outgoing.put(build_message(message_type, payload))
+
+
+def shutdown_connection(conn):
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
 class Client:
-    """One prototype peer, with a listener and a worker per connection."""
+    """One peer, with a listener and a reader and writer per connection."""
 
     def __init__(self, peer_id, host, port, has_file, config):
         self.peer_id = peer_id
         self.host = host
         self.port = port
-        self.has_file = has_file
         self.config = dict(config)
-
-        # file path
         self.file_path = Path("proc_logging") / "peer_files" / f"peer_{peer_id}" / config["FileName"]
+        self.file_size = config["FileSize"]
+        self.piece_size = config["PieceSize"]
+        self.num_pieces = (self.file_size + self.piece_size - 1) // self.piece_size
+        self.bitfield = [has_file] * self.num_pieces
+        self.piece_count = self.num_pieces if has_file else 0
+        self.has_file = has_file
 
-        # calculate the number of pieces based on file size and piece size and set the bit field
-        self.num_pieces = math.ceil(config["FileSize"] / config["PieceSize"])
-        # [True, False, True]
-        self.bitfield = [has_file] * self.num_pieces 
-
-        # key is peer id and value is the bitfield of that peer as a list
-        self.neighbor_bitfields = {}
-
-        # keep track of neighbors that are interested and preferred neighbors
-        self.interested_neighbors = set()
+        self.neighbors = {}
         self.preferred_neighbors = set()
+        self.optimistic_neighbor = None
 
         self.listener_thread = None
+        self.timer_thread = None
         self.connection_threads = []
-        # Addresses are temporary keys until the handshake identifies each peer.
-        self.conns_addrs = {}
-        # key is peer id and value is connection
-        self.conns_peers = {}
+        self.connections = set()
         self._server = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
     def start(self):
-        """Start listening and return so main can start the other peers."""
+        """Prepare the file and start listening for other peers."""
         if self.listener_thread is not None or self._stop_event.is_set():
             raise RuntimeError("Create a new Client to start another listener")
+
+        if self.has_file:
+            if self.file_path.stat().st_size != self.file_size:
+                raise ValueError(f"{self.file_path} does not match the configured FileSize")
+        else:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.file_path.open("wb") as file:
+                file.truncate(self.file_size)
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -76,25 +106,14 @@ class Client:
         self._server = server
         self.port = server.getsockname()[1]
         self.listener_thread = threading.Thread(
-            target=self._accept_connections,
-            name=f"peer-{self.peer_id}-listener",
+            target=self._accept_connections, name=f"peer-{self.peer_id}-listener"
         )
         self.listener_thread.start()
 
-        # creating a thread for the timers
         self.timer_thread = threading.Thread(
-            target=self._preferred_neighbors_loop,
-            name=f"peer-{self.peer_id}-preferred-timer"
+            target=self._neighbor_selection_loop, name=f"peer-{self.peer_id}-neighbor-timer"
         )
-        self.timer_thread.start()    
-
-        # create an empty file that is the size of the full file for each peer
-        if not self.has_file:
-            self.file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.file_path, "wb") as f:
-                f.truncate(self.config["FileSize"]) 
-
-        # logging.info("Peer %s listening on %s:%s", self.peer_id, self.host, self.port)
+        self.timer_thread.start()
 
     def _accept_connections(self):
         while not self._stop_event.is_set():
@@ -104,257 +123,301 @@ class Client:
                 continue
             except OSError:
                 if not self._stop_event.is_set():
-                    logging.exception("Peer %s listener failed", self.peer_id)
+                    logger.exception("Peer %s listener failed", self.peer_id)
                 break
             self._start_connection(conn, addr, initiated=False, expected_id=None)
 
     def connect(self, host, port, expected_id):
-        """Use the same worker for an outgoing socket as for an accepted one."""
         conn = socket.create_connection((host, port), timeout=3)
         conn.settimeout(None)
         self._start_connection(conn, conn.getpeername(), initiated=True, expected_id=expected_id)
 
     def _start_connection(self, conn, addr, initiated, expected_id):
         with self._lock:
-
             if self._stop_event.is_set():
                 conn.close()
                 return
-            
+
             thread = threading.Thread(
                 target=self.handle_connection,
                 args=(conn, addr, initiated, expected_id),
                 name=f"peer-{self.peer_id}-connection-{addr[0]}:{addr[1]}",
             )
-
-            self.conns_addrs[addr] = conn
+            self.connections.add(conn)
             self.connection_threads.append(thread)
             thread.start()
 
     def handle_connection(self, conn, addr, initiated, expected_id):
         other_id = None
+        neighbor = None
+        writer = None
         try:
-            with conn:
-                #send handshake message
-                conn.sendall(build_handshake(self.peer_id))
+            conn.sendall(build_handshake(self.peer_id))
+            other_id = parse_handshake(recv_exact(conn, 32))
+            if other_id == self.peer_id or (expected_id is not None and other_id != expected_id):
+                raise ValueError(f"unexpected peer ID {other_id}")
 
-                # read other peer's handshake
-                data = recv_exact(conn, 32)
-                other_id = parse_handshake(data)
-                # validate
-                if expected_id is not None and other_id != expected_id:
-                    raise ValueError(f"expected peer {expected_id}, got {other_id}")
+            with self._lock:
+                if other_id in self.neighbors:
+                    raise ValueError(f"duplicate connection to peer {other_id}")
+                neighbor = Neighbor([False] * self.num_pieces)
+                if self.piece_count:
+                    neighbor.send(BITFIELD, bitfield_to_bytes(self.bitfield))
+                self.neighbors[other_id] = neighbor
 
-                # add connection to conns_peer (which tracks id to sockets)
-                with self._lock:
-                    self.conns_peers[other_id] = conn
+            writer = threading.Thread(
+                target=self._write_messages,
+                args=(conn, neighbor.outgoing),
+                name=f"peer-{self.peer_id}-writer-{other_id}",
+            )
+            writer.start()
 
-                # this logs the inital connection messages
-                Logger = Proc_Logger()
-                Logger.log_TCP_connection(time.time(), self.peer_id, other_id)
+            if initiated:
+                Proc_Logger().log_TCP_connection(time.time(), self.peer_id, other_id)
+                logger.info("Peer %s makes a connection to Peer %s.", self.peer_id, other_id)
+            else:
+                logger.info("Peer %s is connected from Peer %s.", self.peer_id, other_id)
 
-                # initialize this neighbors bitfield to nothing
-                self.neighbor_bitfields[other_id] = [False] * self.num_pieces
+            while not self._stop_event.is_set():
+                msg_type, payload = read_message(conn)
+                self.handle_message(msg_type, payload, other_id)
 
-                # log connection
-                if initiated:
-                    logging.info("Peer %s makes a connection to Peer %s.", self.peer_id, other_id)
-                else:
-                    logging.info("Peer %s is connected from Peer %s.", self.peer_id, other_id)
-
-                # send bitfield to other peer if self has any pieces
-                if any(self.bitfield):
-                    conn.sendall(build_message(BITFIELD, bitfield_to_bytes(self.bitfield)))
-                
-                while not self._stop_event.is_set():
-                    msg_type, payload = read_message(conn)
-                    self.handle_message(conn, msg_type, payload, other_id)
-
+        except ConnectionError:
+            logger.info("Peer %s disconnected from %s", self.peer_id, other_id)
         except (OSError, ValueError):
             if not self._stop_event.is_set():
-                logging.exception("Peer %s connection to %s failed", self.peer_id, addr)
-        
+                logger.exception("Peer %s connection to %s failed", self.peer_id, addr)
         finally:
             with self._lock:
-                if  self.conns_addrs.get(addr) is conn:
-                    del self.conns_addrs[addr]
+                self.connections.discard(conn)
+                if neighbor is not None:
+                    del self.neighbors[other_id]
+                    self.preferred_neighbors.discard(other_id)
+                    if self.optimistic_neighbor == other_id:
+                        self.optimistic_neighbor = None
+                    if neighbor.requested_piece is not None:
+                        self._resume_waiting_downloads()
 
-                if other_id is not None and self.conns_peers.get(other_id) == conn:
-                    del self.conns_peers[other_id]
+            shutdown_connection(conn)
+            if writer is not None:
+                neighbor.outgoing.put(None)
+                writer.join()
+            conn.close()
 
-            logging.info("Peer %s disconnected from %s", self.peer_id, other_id)
+    @staticmethod
+    def _write_messages(conn, outgoing):
+        # A single writer preserves protocol order without holding the peer lock during sendall.
+        try:
+            while (message := outgoing.get()) is not None:
+                conn.sendall(message)
+        except OSError:
+            shutdown_connection(conn)
 
-    def handle_message(self, conn, msg_type, payload, other_id):
-        """Placeholder: a recv chunk is not necessarily a complete message."""
-        logging.info("Peer %s got message type %s (%s bytes) from %s", self.peer_id, msg_type, len(payload), other_id)
-        
-        # handle a bitfield message
-        if msg_type == BITFIELD:
-            others_bitfield = bytes_to_bitfield(payload, self.num_pieces)
+    def handle_message(self, msg_type, payload, other_id):
+        with self._lock:
+            neighbor = self.neighbors[other_id]
 
-            # lock dictionary so that threads don't overwrite
+            if msg_type == BITFIELD:
+                if len(payload) != (self.num_pieces + 7) // 8:
+                    raise ValueError("invalid bitfield length")
+                neighbor.bitfield = bytes_to_bitfield(payload, self.num_pieces)
+                self._update_interest(neighbor)
+                self._request_piece(neighbor)
+
+            elif msg_type == HAVE:
+                index = self._read_index(payload)
+                neighbor.bitfield[index] = True
+                logger.info("Peer %s received the 'have' message from %s for the piece %s.",
+                            self.peer_id, other_id, index)
+                self._update_interest(neighbor)
+                self._request_piece(neighbor)
+
+            elif msg_type == INTERESTED or msg_type == NOT_INTERESTED:
+                neighbor.interested = msg_type == INTERESTED
+                interest = "interested" if neighbor.interested else "not interested"
+                logger.info("Peer %s received the '%s' message from %s.",
+                            self.peer_id, interest, other_id)
+
+            elif msg_type == CHOKE:
+                neighbor.unchoked_by = False
+                logger.info("Peer %s is choked by %s.", self.peer_id, other_id)
+                if neighbor.requested_piece is not None:
+                    neighbor.requested_piece = None
+                    self._resume_waiting_downloads()
+
+            elif msg_type == UNCHOKE:
+                neighbor.unchoked_by = True
+                logger.info("Peer %s is unchoked by %s.", self.peer_id, other_id)
+                self._request_piece(neighbor)
+
+            elif msg_type == REQUEST:
+                index = self._read_index(payload)
+                if self.bitfield[index] and other_id in self._unchoked_neighbors():
+                    data = self.read_piece(index)
+                    if len(data) != self._piece_length(index):
+                        raise OSError(f"could not read the complete piece {index} from {self.file_path}")
+                    neighbor.send(PIECE, payload + data)
+
+            elif msg_type == PIECE:
+                self._receive_piece(other_id, neighbor, payload)
+
+    def _read_index(self, payload):
+        if len(payload) != 4:
+            raise ValueError("piece index must be four bytes")
+        index = int.from_bytes(payload, "big")
+        if index >= self.num_pieces:
+            raise ValueError("invalid piece index")
+        return index
+
+    def _receive_piece(self, other_id, neighbor, payload):
+        index = self._read_index(payload[:4])
+        if index != neighbor.requested_piece:
+            return
+
+        data = payload[4:]
+        if len(data) != self._piece_length(index):
+            raise ValueError(f"incorrect length for piece {index}")
+
+        self.write_piece(index, data)
+        neighbor.requested_piece = None
+        neighbor.downloaded_bytes += len(data)
+        self.bitfield[index] = True
+        self.piece_count += 1
+        logger.info(
+            "Peer %s has downloaded the piece %s from peer %s. Now the number of pieces it has is %s.",
+            self.peer_id, index, other_id, self.piece_count,
+        )
+
+        for connected_neighbor in self.neighbors.values():
+            connected_neighbor.send(HAVE, payload[:4])
+            self._update_interest(connected_neighbor)
+
+        if self.piece_count == self.num_pieces:
+            self.has_file = True
+            logger.info("Peer %s has downloaded the complete file.", self.peer_id)
+
+        self._request_piece(neighbor)
+
+    def _update_interest(self, neighbor):
+        interested = any(remote and not own for own, remote in zip(self.bitfield, neighbor.bitfield))
+        if interested != neighbor.interest_sent:
+            neighbor.send(INTERESTED if interested else NOT_INTERESTED)
+            neighbor.interest_sent = interested
+
+    def _resume_waiting_downloads(self):
+        if not self._stop_event.is_set():
+            for neighbor in self.neighbors.values():
+                self._request_piece(neighbor)
+
+    def _request_piece(self, neighbor):
+        if not neighbor.unchoked_by or not neighbor.interest_sent or neighbor.requested_piece is not None:
+            return
+
+        reserved = {remote.requested_piece for remote in self.neighbors.values()}
+        candidates = [
+            index for index, available in enumerate(neighbor.bitfield)
+            if available and not self.bitfield[index] and index not in reserved
+        ]
+        if candidates:
+            index = random.choice(candidates)
+            neighbor.requested_piece = index
+            neighbor.send(REQUEST, index.to_bytes(4, "big"))
+
+    def _unchoked_neighbors(self):
+        if self.optimistic_neighbor is None:
+            return self.preferred_neighbors
+        return self.preferred_neighbors | {self.optimistic_neighbor}
+
+    def _send_choke_changes(self, previously_unchoked):
+        unchoked = self._unchoked_neighbors()
+        for peer_id in previously_unchoked - unchoked:
+            self.neighbors[peer_id].send(CHOKE)
+        for peer_id in unchoked - previously_unchoked:
+            self.neighbors[peer_id].send(UNCHOKE)
+
+    def _select_preferred_neighbors(self):
+        candidates = [peer_id for peer_id, neighbor in self.neighbors.items() if neighbor.interested]
+        random.shuffle(candidates)
+        if not self.has_file:
+            # Each rate covers the same interval, so byte totals have the same ordering.
+            candidates.sort(key=lambda peer_id: self.neighbors[peer_id].downloaded_bytes, reverse=True)
+        for neighbor in self.neighbors.values():
+            neighbor.downloaded_bytes = 0
+
+        chosen = set(candidates[:self.config["NumberOfPreferredNeighbors"]])
+        if chosen != self.preferred_neighbors:
+            previously_unchoked = self._unchoked_neighbors()
+            self.preferred_neighbors = chosen
+            self._send_choke_changes(previously_unchoked)
+            logger.info("Peer %s has the preferred neighbors %s.",
+                        self.peer_id, ",".join(str(peer_id) for peer_id in sorted(chosen)))
+
+    def _select_optimistic_neighbor(self):
+        previously_unchoked = self._unchoked_neighbors()
+        candidates = [
+            peer_id for peer_id, neighbor in self.neighbors.items()
+            if neighbor.interested and peer_id not in previously_unchoked
+        ]
+        chosen = random.choice(candidates) if candidates else None
+        if chosen != self.optimistic_neighbor:
+            self.optimistic_neighbor = chosen
+            self._send_choke_changes(previously_unchoked)
+            if chosen is not None:
+                logger.info("Peer %s has the optimistically unchoked neighbor %s.", self.peer_id, chosen)
+
+    def _neighbor_selection_loop(self):
+        preferred_interval = self.config["UnchokingInterval"]
+        optimistic_interval = self.config["OptimisticUnchokingInterval"]
+        now = time.monotonic()
+        preferred_at = now + preferred_interval
+        optimistic_at = now + optimistic_interval
+        while not self._stop_event.wait(max(0, min(preferred_at, optimistic_at) - time.monotonic())):
             with self._lock:
-                self.neighbor_bitfields[other_id] = others_bitfield
+                now = time.monotonic()
+                if now >= preferred_at:
+                    self._select_preferred_neighbors()
+                    preferred_at = now + preferred_interval
+                if now >= optimistic_at:
+                    self._select_optimistic_neighbor()
+                    optimistic_at = now + optimistic_interval
 
-            if self.neighbor_has_something_i_need(others_bitfield):
-                conn.sendall(build_message(INTERESTED))
-            else:
-                conn.sendall(build_message(NOT_INTERESTED))
-
-        elif msg_type == INTERESTED:
-            # if recieving an interested message, add that peer to the interested neighbors set
-            with self._lock:
-                self.interested_neighbors.add(other_id)
-            logging.info("Peer %s received the 'interested' message from %s.", self.peer_id, other_id)
-
-        elif msg_type == NOT_INTERESTED:
-            # if recieving a not interested message, add that peer to the interested neighbors set
-            with self._lock:
-                self.interested_neighbors.discard(other_id)
-            logging.info("Peer %s received the 'not interested' message from %s.", self.peer_id, other_id)
-
-        elif msg_type == CHOKE:
-            logging.info("Peer %s is choked by %s.", self.peer_id, other_id)
-
-        elif msg_type == UNCHOKE:
-            logging.info("Peer %s is unchoked by %s.", self.peer_id, other_id)
-            # send request message
-            piece = self.request_piece(other_id)
-            if piece is not None:
-                conn.sendall(build_message(REQUEST, piece.to_bytes(4, "big")))
-
-        elif msg_type == REQUEST:
-            # send requested piece
-            index = int.from_bytes(payload, "big")
-
-            # only send piece if requester is still a preferred neighbor
-            with self._lock:
-                allowed = other_id in self.preferred_neighbors
-            if allowed:
-                data = self.read_piece(index)
-                conn.sendall(build_message(PIECE, index.to_bytes(4, "big") + data))     
-
-        elif msg_type == PIECE:
-            index = int.from_bytes(payload[:4], "big")
-            data = payload[4:]
-            # write piece to peer's file
-            self.write_piece(index, data)
-
-            # update bitfield
-            with self._lock:
-                self.bitfield[index] = True
-                count = sum(self.bitfield)
-
-            logging.info("Peer %s has downloaded the piece %s from peer %s. Now the number of pieces it has is %s.", self.peer_id, index, other_id, count)
-
+    def has_confirmed_completion(self, peer_ids):
+        """Check our file and the availability announced by every other peer."""
+        with self._lock:
+            return self.has_file and all(
+                peer_id in self.neighbors and all(self.neighbors[peer_id].bitfield)
+                for peer_id in peer_ids if peer_id != self.peer_id
+            )
 
     def stop(self):
-        """Wake blocked socket workers and wait for all tracked threads."""
+        """Wake the listener, timer, and connection workers and wait for them."""
         self._stop_event.set()
         if self._server is not None:
             self._server.close()
 
         with self._lock:
-            connections = list(self.conns_addrs.values())
+            connections = list(self.connections)
             threads = list(self.connection_threads)
 
         for conn in connections:
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            conn.close()
+            shutdown_connection(conn)
 
         if self.listener_thread is not None:
             self.listener_thread.join()
+        if self.timer_thread is not None:
+            self.timer_thread.join()
         for thread in threads:
             thread.join()
 
-    # helper establishing interest
-    def neighbor_has_something_i_need(self, thiers):
-        for i in range(self.num_pieces):
-            if thiers[i] and not self.bitfield[i]:
-                return True
-            else:
-                return False
-
-    def select_preferred_neighbors(self):
-        k = self.config["NumberOfPreferredNeighbors"]
-
-        with self._lock:
-            candidates = list(self.interested_neighbors)
-
-        # if the peer has the whole file, randomly select k neighbors for unchoking
-        if all(self.bitfield):
-            return set(random.sample(candidates, min(k, len(candidates))))
-
-        #TODO: handle selecting preferred neighbors when its not just completely random
-        return set()
-
-    def _preferred_neighbors_loop(self):
-        interval = self.config["UnchokingInterval"]
-
-        # select preferred neighbors every UnchokingInterval seconds
-        while not self._stop_event.wait(interval):
-            chosen = self.select_preferred_neighbors()
-
-            with self._lock:
-                old = self.preferred_neighbors
-                self.preferred_neighbors = chosen
-
-            # if the preferred neighbors are different from the last interval, log that
-            if chosen != old:
-                logging.info("Peer %s has the preferred neighbors %s.",
-                         self.peer_id, ",".join(str(i) for i in sorted(chosen)))
-
-                # for each newly preferred neighbor, send that neighbor an unchoke message
-                for peer in chosen - old:
-                    self._send(peer, build_message(UNCHOKE))
-
-                # for each neighbor that is no longer preferred, send that neighbor a choke message
-                for peer in old - chosen:
-                    self._send(peer, build_message(CHOKE))
-           
-    # helper send function
-    def _send(self, peer_id, data):
-        with self._lock:
-            conn = self.conns_peers.get(peer_id)
-        if conn is None:
-            return
-        try:
-            conn.sendall(data)
-        except OSError:
-            pass
-
-    def request_piece(self, other_id):
-        mine = self.bitfield
-        thiers = self.neighbor_bitfields[other_id]
-        candidate_pieces = []
-
-        # a possible piece to request is a piece that the requested has that the requester does not have
-        for i in range(self.num_pieces):
-            if not mine[i] and thiers[i]:
-                candidate_pieces.append(i)
-
-        if not candidate_pieces:
-            return None
-        return random.choice(candidate_pieces)
+    def _piece_length(self, index):
+        return min(self.piece_size, self.file_size - index * self.piece_size)
 
     def read_piece(self, index):
-        piece_size = self.config["PieceSize"]
-        start = index * piece_size
-        size = min(piece_size, self.config["FileSize"] - start)
-
-        with open(self.file_path, "rb") as f:
-            f.seek(start)
-            return f.read(size)
+        with self.file_path.open("rb") as file:
+            file.seek(index * self.piece_size)
+            return file.read(self._piece_length(index))
 
     def write_piece(self, index, data):
-        piece_size = self.config["PieceSize"]
-        start = index * piece_size
-    
-        with open(self.file_path, "r+b") as f:
-            f.seek(start)
-            f.write(data)
-
-        
+        with self.file_path.open("r+b") as file:
+            file.seek(index * self.piece_size)
+            file.write(data)

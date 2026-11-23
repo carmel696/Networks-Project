@@ -2,15 +2,13 @@
 
 import argparse
 import logging
-from logger import Proc_Logger
-from pathlib import Path
+import shutil
 import sys
-import threading
-import os
 import time
-
+from pathlib import Path
 
 from clients.client import Client
+from logger import Proc_Logger
 
 
 def load_config(config_dir):
@@ -49,33 +47,23 @@ def main():
     parser.add_argument("--base-port", type=int, default=6001)
     args = parser.parse_args()
 
-
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     config, peers = load_config(args.config_dir)
+    peer_ids = [peer["peer_id"] for peer in peers]
     clients = []
 
     try:
         for index, peer in enumerate(peers):
-            # initalize peer directories for file storage in logging/peer_files/peer_ID
-            os.makedirs(f"proc_logging/peer_files/peer_{peer["peer_id"]}", exist_ok=True)
-            # fills out the files for the peers that start with it
-            if (peer["has_file"] == True):
-                with open(f"{args.config_dir}/{peer["peer_id"]}/thefile") as f:
-                    completeFile = f.read()
-                with open(f"proc_logging/peer_files/peer_{peer["peer_id"]}/thefile", "w") as f:
-                    f.write(completeFile)
-            else:
-                with open(f"proc_logging/peer_files/peer_{peer["peer_id"]}/thefile", "w") as f:
-                    f.write("")
-
-            # creates the logging files for each peer within their "logger" directory folders
-            Logger = Proc_Logger()
-            Logger.create_peer_log(peer_id=peer["peer_id"])
-
             # Local overrides leave the original configuration files intact.
+            peer_id = peer["peer_id"]
             host = "127.0.0.1" if args.local else peer["host"]
             port = args.base_port + index if args.local else peer["port"]
-            client = Client(peer["peer_id"], host, port, peer["has_file"], config)
+            client = Client(peer_id, host, port, peer["has_file"], config)
+            client.file_path.parent.mkdir(parents=True, exist_ok=True)
+            if peer["has_file"]:
+                source = args.config_dir / str(peer_id) / config["FileName"]
+                shutil.copyfile(source, client.file_path)
+            Proc_Logger().create_peer_log(peer_id)
             clients.append(client)
             client.start()
 
@@ -85,13 +73,13 @@ def main():
             for earlier_peer in clients[:index]:
                 client.connect(earlier_peer.host, earlier_peer.port, earlier_peer.peer_id)
 
-        logging.info("Started %s peers. Press Ctrl+C to stop.", len(clients))
-        # TODO: replace this wait with detection that all peers have the file.
-        while True:
-            time.sleep(1)
-            
+        logging.info("Started %s peers. Waiting for every peer to confirm completion.", len(clients))
+        # Keep connections open until every peer has received the final availability updates.
+        while not all(client.has_confirmed_completion(peer_ids) for client in clients):
+            time.sleep(0.1)
+        logging.info("All %s peers have confirmed the complete file. Shutting down.", len(clients))
+
     except KeyboardInterrupt:
-        # ctr c
         logging.info("Stopping peers.")
     finally:
         for client in clients:
