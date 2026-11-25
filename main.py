@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 
 from clients.client import Client
-from logger import Proc_Logger
 
 
 def load_config(config_dir):
@@ -63,7 +62,6 @@ def main():
             if peer["has_file"]:
                 source = args.config_dir / str(peer_id) / config["FileName"]
                 shutil.copyfile(source, client.file_path)
-            Proc_Logger().create_peer_log(peer_id)
             clients.append(client)
             client.start()
 
@@ -75,7 +73,12 @@ def main():
 
         logging.info("Started %s peers. Waiting for every peer to confirm completion.", len(clients))
         # Keep connections open until every peer has received the final availability updates.
-        while not all(client.has_confirmed_completion(peer_ids) for client in clients):
+        while True:
+            for client in clients:
+                if client.connection_error is not None:
+                    raise client.connection_error
+            if all(client.has_confirmed_completion(peer_ids) for client in clients):
+                break
             time.sleep(0.1)
         logging.info("All %s peers have confirmed the complete file. Shutting down.", len(clients))
 
