@@ -60,7 +60,9 @@ class Client:
         self.host = host
         self.port = port
         self.config = dict(config)
-        self.file_path = Path("proc_logging") / "peer_files" / f"peer_{peer_id}" / config["FileName"]
+        peer_dir = Path("proc_logging") / "peer_files" / f"peer_{peer_id}"
+        self.file_path = peer_dir / config["FileName"]
+        self.peer_log = Proc_Logger(peer_dir / f"log_peer_{peer_id}.log")
         self.file_size = config["FileSize"]
         self.piece_size = config["PieceSize"]
         self.num_pieces = (self.file_size + self.piece_size - 1) // self.piece_size
@@ -75,6 +77,7 @@ class Client:
         self.listener_thread = None
         self.timer_thread = None
         self.connection_threads = []
+        self.connection_error = None
         self.connections = set()
         self._server = None
         self._stop_event = threading.Event()
@@ -99,6 +102,7 @@ class Client:
             server.bind((self.host, self.port))
             server.listen()
             server.settimeout(0.25)
+            self.peer_log.path.write_text("", encoding="utf-8")
         except OSError:
             server.close()
             raise
@@ -139,13 +143,19 @@ class Client:
                 return
 
             thread = threading.Thread(
-                target=self.handle_connection,
+                target=self._run_connection,
                 args=(conn, addr, initiated, expected_id),
                 name=f"peer-{self.peer_id}-connection-{addr[0]}:{addr[1]}",
             )
             self.connections.add(conn)
             self.connection_threads.append(thread)
             thread.start()
+
+    def _run_connection(self, conn, addr, initiated, expected_id):
+        try:
+            self.handle_connection(conn, addr, initiated, expected_id)
+        except FileNotFoundError as error:
+            self.connection_error = error
 
     def handle_connection(self, conn, addr, initiated, expected_id):
         other_id = None
@@ -157,9 +167,12 @@ class Client:
             if other_id == self.peer_id or (expected_id is not None and other_id != expected_id):
                 raise ValueError(f"unexpected peer ID {other_id}")
 
+            direction = "makes a connection to" if initiated else "is connected from"
+            message = f"Peer {self.peer_id} {direction} Peer {other_id}."
             with self._lock:
                 if other_id in self.neighbors:
                     raise ValueError(f"duplicate connection to peer {other_id}")
+                self.peer_log.append(message)
                 neighbor = Neighbor([False] * self.num_pieces)
                 if self.piece_count:
                     neighbor.send(BITFIELD, bitfield_to_bytes(self.bitfield))
@@ -172,11 +185,7 @@ class Client:
             )
             writer.start()
 
-            if initiated:
-                Proc_Logger().log_TCP_connection(time.time(), self.peer_id, other_id)
-                logger.info("Peer %s makes a connection to Peer %s.", self.peer_id, other_id)
-            else:
-                logger.info("Peer %s is connected from Peer %s.", self.peer_id, other_id)
+            logger.info("%s", message)
 
             while not self._stop_event.is_set():
                 msg_type, payload = read_message(conn)
@@ -184,6 +193,8 @@ class Client:
 
         except ConnectionError:
             logger.info("Peer %s disconnected from %s", self.peer_id, other_id)
+        except FileNotFoundError:
+            raise
         except (OSError, ValueError):
             if not self._stop_event.is_set():
                 logger.exception("Peer %s connection to %s failed", self.peer_id, addr)
